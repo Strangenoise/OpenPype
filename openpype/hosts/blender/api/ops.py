@@ -1,13 +1,14 @@
 """Blender operators and menus for use with Avalon."""
-
+import atexit
+import collections
+from functools import partial
 import os
+from pathlib import Path
+import platform
 from string import digits
 import sys
-import platform
 import time
 import traceback
-import collections
-from pathlib import Path
 from types import ModuleType
 from typing import Dict, List, Optional, Union
 
@@ -23,7 +24,7 @@ from openpype.client.entities import (
     get_asset_by_name,
     get_assets,
 )
-from openpype.hosts.blender.api.lib import add_datablocks_to_container
+from openpype.hosts.blender.api.lib import add_datablocks_to_container,
 from openpype.hosts.blender.api.utils import (
     BL_OUTLINER_TYPES,
     BL_TYPE_DATACOL,
@@ -33,11 +34,24 @@ from openpype.hosts.blender.api.utils import (
     unlink_from_collection,
 )
 from openpype.pipeline import legacy_io
+from openpype.pipeline.context_tools import (
+    get_current_asset_name,
+    get_current_project_name,
+    get_current_task_name,
+    get_workfile_subset,
+)
 from openpype.pipeline.create.creator_plugins import (
     discover_legacy_creator_plugins,
     get_legacy_creator_by_name,
 )
 from openpype.pipeline.create.subset_name import get_subset_name
+from openpype.pipeline.lock import (
+    lock_subset,
+    unlock_subset,
+    get_lock_system_enabled,
+    subset_is_locked_and_lock_is_valid,
+)
+
 from openpype.tools.utils import host_tools
 
 from .workio import OpenFileCacher
@@ -1289,6 +1303,82 @@ def discover_creators_handler(_):
         }
 
 
+class WM_OT_SubsetIsLocked(bpy.types.Operator):
+    """Check if the subset is locked or not.
+
+    If it's locked, the subset locked dialog will open.
+    Otherwise, a dialog notifying user that their subset is not locked will
+    appear.
+    """
+
+    bl_idname = "wm.subset_is_locked_operator"
+    bl_label = "Check opened subset is locked"
+
+    action: bpy.props.EnumProperty(
+        name="Action Enum",
+        items=(
+            ("QUIT", "Quit blender", "Quit blender"),
+            ("PROCEED", "Proceed anyway", "Proceed anyway AT YOUR OWN RISK"),
+        ),
+    )
+
+    def invoke(self, context, _):
+        """Invoke this operator."""
+        context.window_manager.subset_is_locked = (
+            subset_is_locked_and_lock_is_valid()
+        )
+        if context.window_manager.subset_is_locked:
+            return context.window_manager.invoke_props_dialog(self)
+        else:
+            # Lock file and unlock it on blender exit
+            subset = get_workfile_subset(
+                get_current_project_name(),
+                get_current_asset_name(),
+                get_current_task_name()
+            )
+            lock_subset(subset)
+            atexit.register(partial(unlock_subset, subset))
+            return context.window_manager.invoke_popup(self)
+
+    def draw(self, context):
+        """Draw UI."""
+        if context.window_manager.subset_is_locked:
+            col = self.layout.column()
+
+            # Display alert
+            row = col.row()
+            row.alert = True
+            row.label(text="Your subset is locked!")
+
+            # Display enum
+            col.prop(self, "action", expand=True)
+        else:
+            layout = self.layout
+            layout.ui_units_x = 7.5
+            layout.label(text="Subset is available!")
+
+    def execute(self, context):
+        """Execute this operator."""
+        if not context.window_manager.subset_is_locked:
+            return {"FINISHED"}
+
+        elif self.action == "QUIT":
+            bpy.ops.wm.quit_blender()
+            return {"FINISHED"}
+
+        elif self.action == "PROCEED":
+            return {"FINISHED"}
+
+        else:
+            self.report({"ERROR"}, "Undefined enum value error")
+            return {"CANCELLED"}
+
+    def cancel(self, context):
+        """Run when this operator is cancelled."""
+        if context.window_manager.subset_is_locked:
+            bpy.ops.wm.subset_is_locked_operator("INVOKE_DEFAULT")
+
+
 classes = [
     LaunchCreator,
     LaunchLoader,
@@ -1306,6 +1396,7 @@ classes = [
     SCENE_OT_DuplicateOpenpypeInstance,
     SCENE_OT_MoveOpenpypeInstance,
     SCENE_OT_MoveOpenpypeInstanceDatablock,
+    WM_OT_SubsetIsLocked,
 ]
 
 
@@ -1327,6 +1418,29 @@ def register():
 
     # Hack to store creators with parameters for optimization purpose
     bpy.app.handlers.load_post.append(discover_creators_handler)
+
+    # Following actions needs to be launched when the scene is loaded
+    # but as they use operators, we can't use the load_post() handler
+    # as the UI is not totally available when it's triggered.
+    #
+    # That's why a timer is used, this way the code is launched
+    # as soon as the scene AND the ui are fully loaded.
+    #
+    # To call a delayed operator use:
+    # bpy.app.timers.register(partial(delayed_wm_operator, <your operator>), persistent=True)
+    def delayed_wm_operator(wm_operator):
+        if hasattr(
+            bpy.types, wm_operator.idname()
+        ):
+            wm_operator("INVOKE_DEFAULT")
+
+    # Check subset is locked
+    # As this is optional, check settings first
+    if get_lock_system_enabled():
+        bpy.app.timers.register(
+            partial(delayed_wm_operator, bpy.ops.wm.subset_is_locked_operator),
+            persistent=True,
+        )
 
 
 def unregister():
